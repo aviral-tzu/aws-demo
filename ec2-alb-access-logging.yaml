@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+
+  ApplicationName:
+    Type: String
+    Description: Security group for Ec2
+    Default: 'alb-access-logging'
+
+  ApplicationLoadBalancerDNS:
+    Type: String
+    Description: DNS of the ALB
+    Default: 'internal-alb-a-ALBFo-1JFMT7KHQ9701-290874642.eu-west-1.elb.amazonaws.com'
+
+  LoadBalancerHostedZoneId:
+    Type: String
+    Description: HostedZoneId of the Load Balancer
+    Default: 'Z32O12XQLNTSW2'
+  
+
+Resources:  
+
+  SecurityGroupEc2AccessLogging:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupName: !Sub "${ApplicationName}-ec2-sg"
+      GroupDescription: !Sub "${ApplicationName} security group"
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 22
+          ToPort: 22
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 443
+          ToPort: 443
+      VpcId: vpc-c64471a0
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+      RoleName:  AccessLogEC2Role
+
+  EC2RoleProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: AccessLogEC2ProfileRoleName
+      Path: /
+      Roles: [!Ref EC2Role]
+      
+  AccessLoggingEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0ce71448843cb18a1
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref EC2RoleProfile
+      SubnetId: subnet-afd878f5
+      Tags:
+        - Key: Name
+          Value: AccessLogEC2Instance
+      KeyName: MyEc2Key
+      SecurityGroupIds:
+        - !Ref SecurityGroupEc2AccessLogging
+      UserData:
+        Fn::Base64: !Sub |
+          sudo yum -y update
+          sudo yum install docker
+          sudo yum install httpd -y 
+          sudo echo "server 1" > /var/www/html/index.html
+          sudo service httpd start
+          chkconfig httpd on
+
+  BucketFullOfAccessLogs:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: bucket-alb-access-logs-demo
+            
+  BucketPolicyForAccessLogging:
+        Type: 'AWS::S3::BucketPolicy'
+        Properties:
+          Bucket: !Ref BucketFullOfAccessLogs
+          PolicyDocument:
+            Statement:
+              - Action: 's3:PutObject'
+                Effect: Allow
+                Resource:
+                  - !Sub "${BucketFullOfAccessLogs.Arn}"
+                  - !Sub "${BucketFullOfAccessLogs.Arn}/*"
+                Principal:
+                  AWS: "156460612806"
+
+
+  ALBForAccessLogging:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Subnets:
+                - subnet-3d473175
+                - subnet-85fa9de3
+                - subnet-afd878f5
+            LoadBalancerAttributes: 
+                - Key: access_logs.s3.enabled
+                  Value: true
+                - Key: access_logs.s3.bucket
+                  Value: !Ref BucketFullOfAccessLogs
+            SecurityGroups:
+                - !Ref SecurityGroupEc2AccessLogging
+            Scheme: internet-facing
+
+  ALBListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            LoadBalancerArn: !Ref ALBForAccessLogging
+            Port: 80
+            Protocol: HTTP
+            DefaultActions:
+                - Type: forward
+                  TargetGroupArn: !Ref ALBTargetGroup
+
+  ALBTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        DependsOn: ALBForAccessLogging
+        Properties:
+            Name: !Sub "${ApplicationName}-ALB-TG"
+            VpcId: vpc-c64471a0
+            HealthCheckPort: 80
+            Port: 80
+            Protocol: HTTP
+            Matcher:
+                   HttpCode: 200
+            HealthCheckIntervalSeconds: 5
+            HealthCheckPath: /index.html
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 2
+            HealthyThresholdCount: 2
+            TargetType: "instance"
+            Targets:
+                - Id: !Ref AccessLoggingEc2Instance
+                  Port: 80
+            TargetGroupAttributes:
+                - Key: deregistration_delay.timeout_seconds
+                  Value: 30
+
+  ALBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            ListenerArn: !Ref ALBListener
+            Priority: 1
+            Conditions:
+                - Field: path-pattern
+                  Values:
+                     - /
+            Actions:
+                - TargetGroupArn: !Ref ALBTargetGroup
+                  Type: forward
+   
+          
+Outputs:
+  AccessLogsBucketName:
+    Description: S3 Bucket For Application Loadbalancer Access Logging
+    Value: !Ref BucketFullOfAccessLogs
+    Export:
+        Name:
+          Fn::Sub: "${AWS::StackName}-Bucket"
+  AccessLogsEC2Instnace:
+    Description: EC2 Instnace used for Application Loadbalancer Access Logging 
+    Value: !Ref AccessLoggingEc2Instance
+    Export:
+        Name:
+          Fn::Sub: "${AWS::StackName}-Instance"
+  AccessLogsALB:
+    Description: Application Loadbalancer Used For Access Logging 
+    Value: !Ref ALBForAccessLogging
+    Export:
+        Name:
+          Fn::Sub: "${AWS::StackName}-LoadBalancer"
+  
